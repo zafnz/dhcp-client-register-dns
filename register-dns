@@ -1,0 +1,154 @@
+#!/bin/bash
+# 
+# register-dns
+#
+# ISC dhclient-post-exit hook script to use nsupdate to register the
+# hostname and the reverse entries in DNS with the system DNS servers 
+# (usually set by the same DHCP server.
+#
+# Dependencies!
+# sipcalc: Used to reverse the IPv6 address. 
+#
+# This script uses nsupdate, and as such with the correct 
+# authentication keys can do secure DNS.
+#
+# This script should be installed as a dhclient post-exit script
+# Usually this would be putting this file in 
+# /etc/dhcp/dhclient-exit-hooks.d/register-dns
+# and not forgetting to chmod a+x it.
+#
+#
+
+# Default TTL for registering
+ttl=300
+
+# Disable trying to set the reverse DNS
+# NO_PTR=1
+NO_PTR=0
+
+# Set debug to "-d" to see nsupdate debug messages
+# debug="-d"
+# Or blank to be silent.
+debug=""
+
+
+decho() {
+	if [ "$debug" != "" ]; then
+		echo "$*"
+	fi
+}
+
+# We could have gotten the DNS servers from the 
+# supplied $new_domain_name_servers, but that 
+# field doesn't always get supplied, notably
+# with IPv6 (unless there are IPv6 supplied 
+# DNS servers).
+#
+# For now, best to use the system configured
+# DNS servers, which will probably be straight
+# from the DNS server anyway.
+#
+get_dns_servers() {
+	awk '/^nameserver/ { print $2 }' /etc/resolv.conf | tr  \\n " "
+}
+
+rev_ip4() {
+	echo $1 | sed -r 's/([^.]+)(\.[^.]+)(\.[^.]+)\.(.*)/\4\3\2.\1.in-addr.arpa/' 
+}
+
+rev_ip6() {
+	sipcalc -r $1 | grep \\.ip6.arpa\\.
+}
+
+do_dns_update() {
+	ip=$new_ip_address
+	rev=$(rev_ip4 $ip)
+
+	for server in $dns_servers; do
+		update4 $server $hostname $ip $rev
+		if [ "$?" = "0" ]; then
+			return
+		fi
+	done
+}
+
+
+
+update4() {
+	local server hostname ip reverse
+	server=$1
+	hostname=$2
+	ip=$3
+	reverse=$4
+
+	decho "Updating $server with hostname $hostname. ip=$3 reverse=$4"
+
+	
+
+	nsupdate $debug  << EOF
+  server $server
+  update delete $hostname A
+  update add $hostname $ttl A $ip
+
+  update delete $rev
+  update add $rev $ttl PTR $hostname
+  send
+
+EOF
+}
+
+do_dns6_update() {
+
+	ip6=$new_ip6_address
+
+	rev=$(rev_ip6 $ip6)
+	for server in $dns_servers; do
+		update6 $server $hostname $ip6 $rev
+		if [ "$?" = "0" ]; then
+			return
+		fi
+	done
+}
+
+update6() {
+	local server hostname ip reverse
+	server=$1
+	hostname=$2
+	ip6=$3
+	reverse=$4
+
+	decho "Updating $server"
+	decho "hostname $hostname"
+	decho "ip6 $ip6"
+	decho "reverse $reverse"
+
+	nsupdate $debug << EOF6
+server $server
+update delete $hostname AAAA
+update add $hostname $ttl AAAA $ip6
+
+update delete $rev 
+update add $rev $ttl PTR $hostname
+send
+
+EOF6
+
+}
+
+
+dns_servers=$(get_dns_servers)
+	
+hostname=$(hostname)
+decho "using hostname $hostname"
+
+
+case $reason in
+	BOUND|RENEW|REBIND|REBOOT)
+		decho "IPv4"
+		do_dns_update
+	;;
+	BOUND6|RENEW6|REBIND6|REBOOT6)
+		decho "IPv6"
+		do_dns6_update
+	;;
+esac
